@@ -1,0 +1,5 @@
+necesitamos poder realizar un match con un nuevo DF para poder saber las tarifas totales por ruta.
+este nuevo df tiene las transport zone  en una columna(Columna R) y en otra columna la Ruta (Columna U). entoces en la hoja directos/distribucion, tienen que hacer el match para traer la ruta y en el archivo final 
+realizar una tabla pibot asi como las de SHip to pero por ruta.
+el archivo se llama Descripcion de rutas.xlsx y la tabla comienza en B2:U206 
+* quizas este match si lo hacemos al principio con el df billing ya luego es arrastar y a lo ultimo hacer la nueva hoja similar a la de ship to pero  por rutas.
