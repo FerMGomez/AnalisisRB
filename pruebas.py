@@ -3,6 +3,7 @@ import numpy as np
 import re
 import os
 import warnings
+import importlib.util
 
 # Suprimir warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -10,9 +11,16 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 #Este es el que funciona_ se corrio la ultima para calcular febrero2026
 #----------------------------------------------------------------------------
 
+DEBUG = False
+
+RE_RE_VIAJE = re.compile(r'^\d+_[A-Z]{3}_\d+_[A-Z]$')
+RE_UNICO = re.compile(r'^\d+_[A-Z]{3}_\d+$')
+RE_ALCANCE_EXPO = re.compile(r'^\d+_EX_\d+$')
+RE_AR = re.compile(r'^AR[A-Z0-9]{8}$')
+
 
 # --- PARÁMETROS DE ANÁLISIS ---
-MES_DE_ANALISIS = 2  # Enero 2026 (cambiar para otros meses: 2=Feb, 3=Mar, etc.)
+MES_DE_ANALISIS = 3  # Enero 2026 (cambiar para otros meses: 2=Feb, 3=Mar, etc.)
 
 # --- Selección de entorno ---
 print("Selecciona el entorno de ejecución:")
@@ -28,8 +36,10 @@ if entorno == '1':
     maestro_file = os.path.join(BASE_DIR, 'ZCUST.xlsx')
     tarifario_file = os.path.join(BASE_DIR, 'Tarifario_macro.xlsm')
     rutas_file = os.path.join(BASE_DIR, 'Descripcion de rutas.xlsx')
-    # para facturación esperamos los archivos en la carpeta actual
-    RUTA_ARCHIVOS_CIERRE = BASE_DIR
+    # para facturación esperamos el archivo parquet en la carpeta Cierre_Mes
+    VESTACY_BASE = os.path.dirname(BASE_DIR)  # Sube un nivel a Vestacy
+    RUTA_ARCHIVOS_CIERRE = os.path.join(VESTACY_BASE, 'Cierre_Mes')
+    billing_parquet_file = os.path.join(RUTA_ARCHIVOS_CIERRE, 'billing_consolidated.parquet')
 elif entorno == '2':
     # windows u otro entorno: rutas originales
     viajes_file = 'Viajes trafico.xlsx'
@@ -38,6 +48,7 @@ elif entorno == '2':
     tarifario_file = 'Tarifario_macro.xlsm'
     rutas_file = 'Descripcion de rutas.xlsx'
     RUTA_ARCHIVOS_CIERRE = r'C:\Users\fgomez\OneDrive - Reckitt\Documents 1\SAP\SAP GUI'
+    billing_parquet_file = os.path.join(RUTA_ARCHIVOS_CIERRE, 'billing_consolidated.parquet')
 else:
     print("Opción inválida. Saliendo...")
     exit(1)
@@ -49,9 +60,7 @@ required_files = [
     ('Maestro de Clientes', maestro_file),
     ('Tarifario', tarifario_file),
     ('Descripcion de rutas', rutas_file),
-    ('AR02_IcADR_F', os.path.join(RUTA_ARCHIVOS_CIERRE, 'AR02_IcADR_F.XLSX')),
-    ('AR06_IcADR_F', os.path.join(RUTA_ARCHIVOS_CIERRE, 'AR06_IcADR_F.XLSX')),
-    ('FACTURAS_2025_Q3', os.path.join(RUTA_ARCHIVOS_CIERRE, 'FACTURAS_2025_Q3.xlsx'))
+    ('Billing Consolidated (Parquet)', billing_parquet_file)
 ]
 missing = [(name, path) for name, path in required_files if not os.path.exists(path)]
 if missing:
@@ -66,11 +75,12 @@ if missing:
     exit(1)  # Detener la ejecución del script
 
 
+
 # --- Funciones de Utilidad ---
 def normalize_column(df, column):
     """Normaliza una columna de un DataFrame convirtiéndola a string,
     eliminando espacios y rellenando valores nulos."""
-    df[column] = df[column].astype(str).str.strip().fillna("")
+    df[column] = df[column].where(df[column].notna(), '').astype(str).str.strip()
     return df
 
 def normalize_columns(df, columns):
@@ -78,6 +88,124 @@ def normalize_columns(df, columns):
     for col in columns:
         df = normalize_column(df, col)
     return df
+
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+
+def coalesce_columns(df, target, candidates):
+    """Consolida múltiples variantes de una columna en una sola columna canónica."""
+    disponibles = [col for col in candidates if col in df.columns]
+    if not disponibles:
+        return df
+
+    if target not in df.columns:
+        df[target] = df[disponibles[0]]
+        disponibles = disponibles[1:]
+
+    target_vacio = df[target].isna() | df[target].astype(str).str.strip().eq('')
+    for col in disponibles:
+        df.loc[target_vacio, target] = df.loc[target_vacio, col]
+        target_vacio = df[target].isna() | df[target].astype(str).str.strip().eq('')
+
+    return df
+
+
+def preparar_columnas_transporte_viajes(df):
+    """Normaliza las columnas de transporte del archivo de viajes.
+
+    Soporta el formato nuevo con TRANSPORTE_ALCANCE y TRANSPORTE_XD,
+    manteniendo compatibilidad con archivos viejos que solo traen TRANSPORTE.
+    """
+    df = df.copy()
+
+    if 'TRANSPORTE_ALCANCE' in df.columns:
+        transporte_alcance = df['TRANSPORTE_ALCANCE'].where(df['TRANSPORTE_ALCANCE'].notna(), '')
+    elif 'TRANSPORTE' in df.columns:
+        transporte_alcance = df['TRANSPORTE'].where(df['TRANSPORTE'].notna(), '').astype(str).str.split('/').str[0]
+    else:
+        transporte_alcance = ''
+
+    df['TRANSPORTE_ALCANCE'] = pd.Series(transporte_alcance, index=df.index).astype(str).str.strip().str.upper()
+
+    if 'TRANSPORTE_XD' in df.columns:
+        transporte_xd = df['TRANSPORTE_XD'].where(df['TRANSPORTE_XD'].notna(), '')
+        transporte_xd = pd.Series(transporte_xd, index=df.index).astype(str).str.strip().str.upper()
+    elif 'TRANSPORTE' in df.columns:
+        transporte_parts = df['TRANSPORTE'].where(df['TRANSPORTE'].notna(), '').astype(str).str.strip().str.upper().str.split('/')
+        transporte_xd = transporte_parts.str.get(0)
+        mask_dist = df['TIPO DE VIAJE'].astype(str).str.strip().isin(['Distribución - Troncal', 'Alcance - Distribución'])
+        mask_split = transporte_parts.str.len() > 1
+        transporte_xd.loc[mask_dist & mask_split] = transporte_parts[mask_dist & mask_split].str.get(-1)
+        transporte_xd.loc[~mask_dist] = ''
+    else:
+        transporte_xd = pd.Series('', index=df.index, dtype='object')
+
+    df['TRANSPORTE_XD'] = pd.Series(transporte_xd, index=df.index).astype(str).str.strip().str.upper()
+    return df
+
+
+def clasificar_t_viaje_vectorizado(df):
+    """Clasifica T_VIAJE de forma vectorizada para evitar apply por fila."""
+    id_viaje = df['ID_VIAJES'].where(df['ID_VIAJES'].notna(), '').astype(str).str.strip()
+    tipo_viaje = df['TIPO DE VIAJE'].where(df['TIPO DE VIAJE'].notna(), '').astype(str).str.strip()
+
+    resultado = pd.Series('Otro', index=df.index, dtype='object')
+
+    mask_alcance_d = tipo_viaje.eq('Alcance - Distribución')
+    mask_re_viaje = id_viaje.str.match(RE_RE_VIAJE) & tipo_viaje.eq('Simple')
+    mask_unico = id_viaje.str.match(RE_UNICO) & tipo_viaje.eq('Simple')
+    mask_alcance_expo = id_viaje.str.match(RE_ALCANCE_EXPO) & tipo_viaje.eq('Exportación')
+    mask_alcance = id_viaje.str.match(RE_AR) & tipo_viaje.isin(['Alcance', 'Exportación'])
+    mask_retiro = id_viaje.str.match(RE_AR) & tipo_viaje.eq('Retiro')
+    mask_distribucion = id_viaje.str.match(RE_UNICO) & tipo_viaje.eq('Distribución - Troncal')
+
+    resultado.loc[mask_alcance_d] = 'Alcance_D'
+    resultado.loc[mask_re_viaje] = 'Re_Viaje'
+    resultado.loc[mask_unico] = 'Unico'
+    resultado.loc[mask_alcance_expo] = 'Alcance_Expo'
+    resultado.loc[mask_alcance] = 'Alcance'
+    resultado.loc[mask_retiro] = 'Retiro'
+    resultado.loc[mask_distribucion] = 'Distribución'
+
+    return resultado
+
+
+def preparar_tarifario_auxiliares(tarifario):
+    """Precalcula estructuras auxiliares del tarifario para reutilizarlas."""
+    id_vars = ['CARRIER', 'TRANSPORT ZONE']
+    value_vars = [col for col in tarifario.columns if col not in id_vars]
+
+    tarifario_long = tarifario.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name='UNIDAD_NORM',
+        value_name='Tarifa_Base'
+    )
+    tarifario_long['TRANSPORTE_NORM'] = tarifario_long['CARRIER'].astype(str).str.strip().str.upper()
+    tarifario_long['ZONE_KEY'] = tarifario_long['TRANSPORT ZONE'].astype(str).str.strip().str.upper()
+    tarifario_long['UNIDAD_NORM'] = tarifario_long['UNIDAD_NORM'].astype(str).str.strip().str.upper()
+
+    tarifario_dist = tarifario.rename(
+        columns={'CARRIER': 'TRANSPORTE_NORM', 'TRANSPORT ZONE': 'ZONE_KEY'}
+    ).copy()
+    tarifario_dist['TRANSPORTE_NORM'] = tarifario_dist['TRANSPORTE_NORM'].astype(str).str.strip().str.upper()
+    tarifario_dist['ZONE_KEY'] = tarifario_dist['ZONE_KEY'].astype(str).str.strip().str.upper()
+
+    zona_interior_ref = 'AR00BA1001'
+    tarifario_ref = tarifario_long[tarifario_long['ZONE_KEY'] == zona_interior_ref][
+        ['TRANSPORTE_NORM', 'UNIDAD_NORM', 'Tarifa_Base']
+    ].copy()
+    tarifario_ref.rename(columns={'Tarifa_Base': 'Tarifa_Ref'}, inplace=True)
+    tarifario_ref.drop_duplicates(subset=['TRANSPORTE_NORM', 'UNIDAD_NORM'], inplace=True)
+
+    return {
+        'long': tarifario_long,
+        'dist': tarifario_dist,
+        'ref': tarifario_ref,
+    }
 
 def clasificar_t_viaje(row):
     """Clasifica el tipo de viaje (T_VIAJE) basándose en el ID del viaje y
@@ -168,6 +296,10 @@ def load_customer_master(path):
     df = df[df['Sold To Num'].str.startswith('1')].copy()
     df.drop_duplicates(subset=['Ship To'], inplace=True)
     df['Customer_Name_City'] = df['Customer Number'] + ' (' + df['City'] + ')'
+    
+    # Normalizar columnas clave a string antes de renombrar
+    df['Ship To'] = df['Ship To'].astype(str).str.strip()
+    
     df.rename(columns={
         'Sold To Num': 'CLIENTE_MC_NUM', 
         'Customer Number': 'CLIENTE_MC_NAME',
@@ -182,7 +314,7 @@ def load_rutas(path):
     normaliza y elimina duplicados.
     """
     # Columnas: A=0, B=1, ..., R=17, U=20
-    df = pd.read_excel(path, usecols=[17, 20], skiprows=1, engine='openpyxl', header=None)
+    df = pd.read_excel(path, sheet_name='OBD', usecols=[17, 20], skiprows=1, engine='openpyxl', header=None)
     df.columns = ['TRANSPORT ZONE', 'Ruta']
     df = normalize_columns(df, ['TRANSPORT ZONE', 'Ruta'])
     df.drop_duplicates(subset=['TRANSPORT ZONE'], inplace=True)
@@ -199,26 +331,123 @@ def load_tarifario(path):
     df = normalize_columns(df, ['CARRIER', 'TRANSPORT ZONE'])
     return df
 
+
+def preparar_billing_consolidado(billing_df, customer_master_df, rutas_df):
+    """Normaliza y enriquece el billing consolidado.
+
+    Si el parquet ya trae columnas enriquecidas, las reutiliza. Si no,
+    completa los datos desde maestro de clientes y descripción de rutas.
+    """
+    billing = billing_df.copy()
+
+    columns_to_normalize = [
+        'Ship to party',
+        'Reference Document number',
+        'Billing document',
+        'Accounting document number',
+        'LR number',
+        'Reference',
+        'TRANSPORT ZONE',
+        'Ruta',
+        'Ruta_SAP',
+        'RUTA SAP',
+    ]
+    billing = normalize_columns(billing, [col for col in columns_to_normalize if col in billing.columns])
+
+    if 'Billing date' in billing.columns:
+        billing['Billing date'] = pd.to_datetime(billing['Billing date'], errors='coerce')
+
+    if 'source_file' not in billing.columns:
+        billing['source_file'] = 'billing_consolidated.parquet'
+
+    required_customer_cols = ['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME', 'Customer_Name_City', 'TRANSPORT ZONE']
+    missing_customer_cols = [col for col in required_customer_cols if col not in billing.columns]
+    if missing_customer_cols:
+        rows_before_merge = len(billing)
+        billing = pd.merge(
+            billing,
+            customer_master_df,
+            left_on='Ship to party',
+            right_on='Ship To',
+            how='left'
+        )
+        rows_after_merge = len(billing)
+        if rows_after_merge != rows_before_merge:
+            print(
+                f"Advertencia: el merge de facturación con maestro de clientes cambió "
+                f"el número de filas de {rows_before_merge} a {rows_after_merge}"
+            )
+        billing.drop(columns=['Ship To'], inplace=True, errors='ignore')
+
+    billing = coalesce_columns(billing, 'TRANSPORT ZONE', ['TRANSPORT ZONE', 'TRANSPORT ZONE_x', 'TRANSPORT ZONE_y'])
+    billing = coalesce_columns(billing, 'Ruta', ['Ruta', 'Ruta_x', 'Ruta_y', 'Ruta_SAP', 'RUTA SAP'])
+    billing = coalesce_columns(billing, 'Ruta_SAP', ['Ruta_SAP', 'Ruta_SAP_x', 'Ruta_SAP_y', 'RUTA SAP', 'Ruta'])
+
+    if 'Ruta' not in billing.columns:
+        if 'Ruta_SAP' in billing.columns:
+            billing['Ruta'] = billing['Ruta_SAP']
+        elif 'RUTA SAP' in billing.columns:
+            billing['Ruta'] = billing['RUTA SAP']
+        else:
+            billing = pd.merge(billing, rutas_df, on='TRANSPORT ZONE', how='left')
+
+    if 'Ruta_SAP' not in billing.columns:
+        if 'RUTA SAP' in billing.columns:
+            billing['Ruta_SAP'] = billing['RUTA SAP']
+        elif 'Ruta' in billing.columns:
+            billing['Ruta_SAP'] = billing['Ruta']
+
+    if 'Ruta' in billing.columns:
+        billing['Ruta'] = billing['Ruta'].fillna('')
+    if 'Ruta_SAP' in billing.columns:
+        billing['Ruta_SAP'] = billing['Ruta_SAP'].fillna('')
+
+    return billing
+
+
+def filtrar_billing_operativo(billing_df):
+    """Aplica filtros de negocio sobre billing consolidado."""
+    billing = billing_df.copy()
+
+    if 'Accounting document number' in billing.columns:
+        accounting_doc = billing['Accounting document number'].where(
+            billing['Accounting document number'].notna(), ''
+        ).astype(str).str.strip()
+        billing = billing[accounting_doc != ''].copy()
+
+    if 'Ship to party' in billing.columns:
+        ship_to_exclude = {"3000021508", "1000078395", "1000078394", "1000078144"}
+        ship_to = billing['Ship to party'].where(billing['Ship to party'].notna(), '').astype(str).str.strip()
+        billing = billing[~ship_to.isin(ship_to_exclude)].copy()
+
+    return billing
+
+
+def agregar_source_suffix(df, source_map):
+    billing = df.copy()
+    if 'source_file' not in billing.columns:
+        billing['source_file'] = 'billing_consolidated.parquet'
+    billing['source_suffix'] = billing['source_file'].map(source_map).fillna('Otro')
+    return billing
+
+
+def reset_index_if_needed(df):
+    if isinstance(df.index, pd.RangeIndex):
+        return df
+    return df.reset_index()
+
 # --- Lógica de Tarifas ---
-def asignar_tarifa_vectorizado(df_viajes, tarifario):
+def asignar_tarifa_vectorizado(df_viajes, tarifario_aux):
     """Asigna tarifas a los viajes y determina el motivo del resultado de forma vectorizada, incluyendo la lógica de penalidades."""
     df = df_viajes.copy()
 
+    # Algunas corridas (p. ej. viajes directos) pueden no traer esta columna.
+    if 'Gross weight' not in df.columns:
+        df['Gross weight'] = np.nan
+
     # --- 1. Normalización y Claves ---
-    # Implementación de la lógica para transportistas divididos
-    transporte_parts = df['TRANSPORTE'].astype(str).str.strip().str.upper().str.split('/')
-    
-    # Por defecto, se usa el primer transportista (o el único si no hay división)
-    df['TRANSPORTE_NORM'] = transporte_parts.str.get(0)
-    
-    # Para viajes de 'Distribución - Troncal' con transportista dividido, se usa el segundo
-    is_dist_mask = df['TIPO DE VIAJE'].astype(str).str.strip().str.upper() == 'DISTRIBUCIÓN - TRONCAL'
-    has_multiple = transporte_parts.str.len() > 1
-    
-    # Aplicar la lógica usando .loc para una asignación segura
-    mask = is_dist_mask & has_multiple
-    if mask.any():
-        df.loc[mask, 'TRANSPORTE_NORM'] = transporte_parts[mask].str.get(-1)
+    # El caller ya define qué transportista corresponde para cada cálculo.
+    df['TRANSPORTE_NORM'] = df['TRANSPORTE'].astype(str).str.strip().str.upper()
 
     df['TIPO_VIAJE_NORM'] = df['TIPO DE VIAJE'].astype(str).str.strip().str.upper()
     df['UNIDAD_NORM'] = df['UNIDAD'].astype(str).str.strip().str.upper()
@@ -228,45 +457,39 @@ def asignar_tarifa_vectorizado(df_viajes, tarifario):
     df['ZONE_KEY'] = np.where(df['T_VIAJE'].isin(['Alcance', 'Retiro']), df['ID_VIAJES_NORM'], df['TRANSPORT_ZONE_NORM'])
 
     # --- DEPURACIÓN: Ver valores clave ---
-    print("DEPURACIÓN - Valores en df para tarifación:")
-    print("Ejemplos de filas:")
-    print(df[['TRANSPORTE_NORM', 'ZONE_KEY', 'UNIDAD_NORM', 'T_VIAJE']].head(5))
-    print(f"Transportistas únicos en df: {sorted(df['TRANSPORTE_NORM'].unique())[:10]}...")
-    print(f"Zonas únicas en df: {sorted(df['ZONE_KEY'].unique())[:10]}...")
-    print(f"Unidades únicas en df: {sorted(df['UNIDAD_NORM'].unique())[:5]}...")
+    debug_print("DEPURACIÓN - Valores en df para tarifación:")
+    debug_print("Ejemplos de filas:")
+    debug_print(df[['TRANSPORTE_NORM', 'ZONE_KEY', 'UNIDAD_NORM', 'T_VIAJE']].head(5))
+    debug_print(f"Transportistas únicos en df: {sorted(df['TRANSPORTE_NORM'].unique())[:10]}...")
+    debug_print(f"Zonas únicas en df: {sorted(df['ZONE_KEY'].unique())[:10]}...")
+    debug_print(f"Unidades únicas en df: {sorted(df['UNIDAD_NORM'].unique())[:5]}...")
 
     # --- 2. Cálculo de Tarifa Base (para todos los viajes) ---
     # Se calcula una tarifa base para todos, que luego se ajustará si es una penalidad.
     
-    # Preparar tarifario en formato largo para viajes directos
-    id_vars = ['CARRIER', 'TRANSPORT ZONE']
-    value_vars = [col for col in tarifario.columns if col not in id_vars]
-    tarifario_long = tarifario.melt(id_vars=id_vars, value_vars=value_vars, var_name='UNIDAD_NORM', value_name='Tarifa_Base')
-    tarifario_long['TRANSPORTE_NORM'] = tarifario_long['CARRIER'].str.strip().str.upper()
-    tarifario_long['ZONE_KEY'] = tarifario_long['TRANSPORT ZONE'].str.strip().str.upper()
-    tarifario_long['UNIDAD_NORM'] = tarifario_long['UNIDAD_NORM'].str.strip().str.upper()
+    tarifario_long = tarifario_aux['long']
 
-    print("DEPURACIÓN - Tarifario:")
-    print(f"Transportistas únicos en tarifario: {sorted(tarifario_long['TRANSPORTE_NORM'].unique())[:10]}...")
-    print(f"Zonas únicas en tarifario: {sorted(tarifario_long['ZONE_KEY'].unique())[:10]}...")
-    print(f"Unidades únicas en tarifario: {sorted(tarifario_long['UNIDAD_NORM'].unique())[:5]}...")
+    debug_print("DEPURACIÓN - Tarifario:")
+    debug_print(f"Transportistas únicos en tarifario: {sorted(tarifario_long['TRANSPORTE_NORM'].unique())[:10]}...")
+    debug_print(f"Zonas únicas en tarifario: {sorted(tarifario_long['ZONE_KEY'].unique())[:10]}...")
+    debug_print(f"Unidades únicas en tarifario: {sorted(tarifario_long['UNIDAD_NORM'].unique())[:5]}...")
 
     # Unir para obtener tarifa de viajes directos
     df = pd.merge(df, tarifario_long, on=['TRANSPORTE_NORM', 'ZONE_KEY', 'UNIDAD_NORM'], how='left')
 
-    print(f"DEPURACIÓN - Después del merge base: {df['Tarifa_Base'].notna().sum()} / {len(df)} viajes con tarifa encontrada.")
+    debug_print(f"DEPURACIÓN - Después del merge base: {df['Tarifa_Base'].notna().sum()} / {len(df)} viajes con tarifa encontrada.")
 
     # Calcular tarifa para viajes de distribución
     dist_mask = ~df['TIPO_VIAJE_NORM'].isin(['SIMPLE', 'DOS PUNTOS', 'EXPORTACIÓN', 'ALCANCE', 'RETIRO'])
     if dist_mask.any():
-        print("DEPURACIÓN - Viajes de distribución:")
-        print(f"Viajes de distribución: {dist_mask.sum()}")
-        print("Ejemplos:")
-        print(df[dist_mask][['TRANSPORTE_NORM', 'ZONE_KEY', 'Gross weight']].head(3))
-        tarifario_dist = tarifario.rename(columns={'CARRIER': 'TRANSPORTE_NORM', 'TRANSPORT ZONE': 'ZONE_KEY'})
+        debug_print("DEPURACIÓN - Viajes de distribución:")
+        debug_print(f"Viajes de distribución: {dist_mask.sum()}")
+        debug_print("Ejemplos:")
+        debug_print(df[dist_mask][['TRANSPORTE_NORM', 'ZONE_KEY', 'Gross weight']].head(3))
+        tarifario_dist = tarifario_aux['dist']
         # Usamos un merge separado para distribución para no crear filas duplicadas por el melt
         df_dist_merged = pd.merge(df[dist_mask].drop(columns=['Tarifa_Base']), tarifario_dist, on=['TRANSPORTE_NORM', 'ZONE_KEY'], how='left')
-        print(f"Después del merge de distribución: {df_dist_merged['Aforo x 900KG'].notna().sum()} / {len(df_dist_merged)} con aforo encontrado.")
+        debug_print(f"Después del merge de distribución: {df_dist_merged['Aforo x 900KG'].notna().sum()} / {len(df_dist_merged)} con aforo encontrado.")
 
         cond_andreani = df_dist_merged['TRANSPORTE_NORM'] == 'ANDREANI LOGISTICA S.A.'
         cond_giampa_logis = df_dist_merged['TRANSPORTE_NORM'].isin(['GIAMPAOLETTI BUOSI S.A.', 'LOGISCHER NEA SA'])
@@ -298,10 +521,7 @@ def asignar_tarifa_vectorizado(df_viajes, tarifario):
     df['Tarifa'] = df['Tarifa_Base'] # Empezamos con la tarifa base
 
     if es_penalidad.any():
-        # Creamos un dataframe con las tarifas de referencia para penalidades del interior
-        tarifario_ref = tarifario_long[tarifario_long['ZONE_KEY'] == ZONA_INTERIOR_REF][['TRANSPORTE_NORM', 'UNIDAD_NORM', 'Tarifa_Base']].copy()
-        tarifario_ref.rename(columns={'Tarifa_Base': 'Tarifa_Ref'}, inplace=True)
-        tarifario_ref.drop_duplicates(subset=['TRANSPORTE_NORM', 'UNIDAD_NORM'], inplace=True)
+        tarifario_ref = tarifario_aux['ref']
 
         # Unimos la tarifa de referencia al dataframe principal
         df = pd.merge(df, tarifario_ref, on=['TRANSPORTE_NORM', 'UNIDAD_NORM'], how='left')
@@ -351,56 +571,64 @@ try:
     df_alcance_config = pd.read_excel(alcance_file, engine='openpyxl')
     # maestro_file y tarifario_file ya definidos según el sistema
     tarifario = load_tarifario(tarifario_file)
+    tarifario_aux = preparar_tarifario_auxiliares(tarifario)
     customer_master_df = load_customer_master(maestro_file)
     df_rutas = load_rutas(rutas_file)
 
-    # construir lista de ficheros de cierre adaptándose al separador del sistema
-    cierreF = [
-        os.path.join(RUTA_ARCHIVOS_CIERRE, 'AR02_IcADR_F.XLSX'),
-        os.path.join(RUTA_ARCHIVOS_CIERRE, 'AR06_IcADR_F.XLSX'),
-        os.path.join(RUTA_ARCHIVOS_CIERRE, 'FACTURAS_2025_Q3.xlsx')
-    ]
-    filtro_a = ['LR number', 'Billing date', 'Plant', 'Ship to party', 'Ship to party name', 'Reference Document number', 'Material', 'Batch number', 'Billed quantity (Base UoM)', 'Gross weight','Sales UoM', 'Billing document', 'Accounting document number', 'Reference']
-    billing_b_full = load_billing(cierreF, filtro_a, month_to_filter=None) # Cargar todo para V_BASE
-    
-    # Usar SOLO datos de 2026 o posteriores (dejar fuera FACTURAS_2025_Q3 que es viejo)
-    billing_b_full = billing_b_full[billing_b_full['Billing date'].dt.year >= 2026].copy()
-    
-    # Hacer el merge UNA SOLA VEZ
-    rows_before_merge = len(billing_b_full)
-    billing_b_full = pd.merge(billing_b_full, customer_master_df, left_on='Ship to party', right_on='Ship To', how='left')
-    rows_after_merge = len(billing_b_full)
-    if rows_after_merge != rows_before_merge:
-        print(f"Advertencia: el merge de facturación con maestro de clientes cambió el número de filas de {rows_before_merge} a {rows_after_merge}")
-    # chequear duplicados de llave de unión
-    dup = billing_b_full[['Ship to party']].duplicated().sum()
-    if dup:
-        print(f"Advertencia: hay {dup} filas duplicadas en billing_b_full despues del merge por 'Ship to party'")
-    billing_b_full.drop(columns=['Ship To'], inplace=True)
+    # cargar archivo parquet consolidado de facturación
+    print(f"  Cargando archivo parquet: {billing_parquet_file}")
+    try:
+        billing_b_full = pd.read_parquet(billing_parquet_file)
+        print(f"  Archivo parquet cargado: {len(billing_b_full)} filas")
+        # Asegurar que 'Billing date' sea datetime
+        if 'Billing date' in billing_b_full.columns:
+            billing_b_full['Billing date'] = pd.to_datetime(billing_b_full['Billing date'])
+            print(f"    Fechas: {billing_b_full['Billing date'].min()} a {billing_b_full['Billing date'].max()}")
+        # Crear columna source_file si no existe
+        if 'source_file' not in billing_b_full.columns:
+            billing_b_full['source_file'] = 'billing_consolidated.parquet'
+    except Exception as e:
+        print(f"Error al leer archivo parquet: {e}")
+        exit()
 
-    # Merge con descripción de rutas
-    billing_b_full = pd.merge(billing_b_full, df_rutas, on='TRANSPORT ZONE', how='left')
+    # Usar SOLO datos de 2026 o posteriores
+    billing_b_full = billing_b_full[billing_b_full['Billing date'].dt.year >= 2026].copy()
+    billing_b_full = preparar_billing_consolidado(billing_b_full, customer_master_df, df_rutas)
+    billing_b_full = filtrar_billing_operativo(billing_b_full)
 
     # Crear la version filtrada DESPUÉS del merge
     billing_b_filtered = billing_b_full[billing_b_full['Billing date'].dt.month == MES_DE_ANALISIS].copy()
+    if billing_b_filtered.empty:
+        fecha_max = billing_b_full['Billing date'].max()
+        print(
+            f"Advertencia: no hay facturación para el mes {MES_DE_ANALISIS} en el parquet. "
+            f"Última fecha disponible: {fecha_max}"
+        )
+
+    billing_match_source = billing_b_full.copy()
+    billing_report_source = billing_b_filtered.copy() if not billing_b_filtered.empty else billing_b_full.copy()
 
 except FileNotFoundError as e: print(f"Error: No se encontró el archivo {e.filename}."); exit()
 except Exception as e: print(f"Error al leer archivos Excel: {e}"); exit()
 
 # --- Lógica de procesamiento de viajes (V_BASE) ---
 transportes_correctos = ['ANDREANI LOGISTICA S.A.', 'CELSUR LOGISTICA S.A.', 'DISTRI 10 S.R.L.', 'GIAMPAOLETTI BUOSI S.A.', 'I-FLOW S.A.', 'LOGISCHER NEA SA', 'TTES. LOS AMIGOS S.A.', 'WAL-MART ARGENTINA SRL']
-# Se modifica el filtro para incluir transportistas combinados, usando la primera parte del nombre.
-transporte_base = df_viajes_trafico['TRANSPORTE'].astype(str).str.split('/').str[0].str.strip()
+tipos_simples = ['Simple', 'Dos Puntos', 'Exportación', 'Alcance', 'Retiro']
+tipos_distribucion = ['Distribución - Troncal', 'Alcance - Distribución']
+# Normalizar columnas de transporte del archivo de viajes.
+df_viajes_trafico = preparar_columnas_transporte_viajes(df_viajes_trafico)
+transporte_base = df_viajes_trafico['TRANSPORTE_ALCANCE'].astype(str).str.strip()
 df = df_viajes_trafico[transporte_base.isin(transportes_correctos)].copy()
 df['ID_VIAJES'] = df['N DE VIAJE'].astype(str).str.split(',').str[0].str.split('&').str[0].str.strip()
-df['T_VIAJE'] = df.apply(clasificar_t_viaje, axis=1)
+df['T_VIAJE'] = clasificar_t_viaje_vectorizado(df)
 
 columnas_finales = ['ID_FILA', 'FECHA CTA', 'N DE VIAJE', 'ID_VIAJES', 'T_VIAJE', 'UNIDAD', 'CLIENTE', 'OBD', 'LOCALIDAD', 'TIPO DE VIAJE', 'PRESENTISMO']
 df_final = df[[c for c in columnas_finales if c in df.columns]].copy()
-# agregar las nuevas columnas de transportistas desde el dataframe original
-df_final['Transporte_Alcance'] = df['TRANSPORTE']
-df_final['Transporte_Distribucion'] = ''
+# agregar las columnas de transportistas desde el dataframe original
+df_final['TRANSPORTE_ALCANCE'] = df['TRANSPORTE_ALCANCE']
+df_final['TRANSPORTE_XD'] = df['TRANSPORTE_XD']
 
+# Normalizar OBD para merges
 df_final['OBD'] = df_final['OBD'].astype(str).str.split(',').str[0].str.strip()
 
 # comprobación inicial de duplicados en df_final
@@ -410,39 +638,21 @@ if dup_inicio:
 
 # --- INICIO NUEVA LÓGICA DE CÁLCULO UNIFICADO ---
 
-# 1. Extraer los transportistas para cada función (Alcance y Distribución)
+# 1. Validar los transportistas para cada función (Alcance y Distribución)
 print("Determinando transportistas de Alcance y Distribución...")
-# normalizamos la columna de alcance siempre (primer transportista)
-df_final['Transporte_Alcance'] = df['TRANSPORTE'].astype(str).str.split('/').str[0].str.strip().str.upper()
-# para distribución arrancamos igual y luego se reemplaza solo en los casos aplicables
-df_final['Transporte_Distribucion'] = df['TRANSPORTE'].astype(str).str.split('/').str[0].str.strip().str.upper()
-
 mask_alc_dist = df_final['TIPO DE VIAJE'] == 'Alcance - Distribución'
 if mask_alc_dist.any():
-    # Para 'Alcance - Distribución', usar el segundo transportista si hay '/', sino el mismo
-    indices_alc_dist = df_final[mask_alc_dist].index
-    for idx in indices_alc_dist:
-        transporte = df.loc[idx, 'TRANSPORTE']
-        if '/' in str(transporte):
-            df_final.loc[idx, 'Transporte_Distribucion'] = str(transporte).split('/')[-1].strip().upper()
-        else:
-            df_final.loc[idx, 'Transporte_Distribucion'] = df_final.loc[idx, 'Transporte_Alcance']
     print(f"Detectados {mask_alc_dist.sum()} viajes de tipo 'Alcance - Distribución'.")
 
-mask_split_troncal = (df_final['TIPO DE VIAJE'] == 'Distribución - Troncal') & (df['TRANSPORTE'].str.contains('/'))
-if mask_split_troncal.any():
-    df_final.loc[mask_split_troncal, 'Transporte_Distribucion'] = df.loc[mask_split_troncal, 'TRANSPORTE'].str.split('/').str[-1].str.strip().str.upper()
-    print(f"Detectados {mask_split_troncal.sum()} viajes de 'Distribución - Troncal' con transportista dividido.")
-
-# para el resto de filas no aplicables dejamos la columna vacía
-no_dist_mask = ~df_final['TIPO DE VIAJE'].isin(['Distribución - Troncal', 'Alcance - Distribución'])
-if no_dist_mask.any():
-    df_final.loc[no_dist_mask, 'Transporte_Distribucion'] = ''
+mask_dist = df_final['TIPO DE VIAJE'].isin(['Distribución - Troncal', 'Alcance - Distribución'])
+mask_xd_vacio = mask_dist & df_final['TRANSPORTE_XD'].eq('')
+if mask_xd_vacio.any():
+    print(f"Advertencia: {mask_xd_vacio.sum()} viajes de distribución no tienen TRANSPORTE_XD informado.")
 
 # 2. Calcular Tarifa de Alcance
 print("Calculando tarifas de Alcance...")
 # ajustamos nombres para coincidir con nuestras columnas nuevas
-df_alcance_config.rename(columns={'TRANSPORTISTA': 'Transporte_Alcance', 'ALCANCE': 'Tarifa_Alcance'}, inplace=True, errors='ignore')
+df_alcance_config.rename(columns={'TRANSPORTISTA': 'TRANSPORTE_ALCANCE', 'ALCANCE': 'Tarifa_Alcance'}, inplace=True, errors='ignore')
 
 # Para buscar la tarifa, los viajes 'Alcance - Distribución' deben mapearse a 'Alcance', 
 # que es como probablemente figuran en el archivo Tarifas_Alcance.xlsx.
@@ -452,9 +662,9 @@ df_final['TIPO_VIAJE_ALCANCE_KEY'] = df_final['TIPO DE VIAJE'].replace({'Alcance
 # Hacemos el merge usando la clave temporal
 df_final = pd.merge(
     df_final, 
-    df_alcance_config[['Transporte_Alcance', 'TIPO DE VIAJE', 'Tarifa_Alcance']],
-    left_on=['Transporte_Alcance', 'TIPO_VIAJE_ALCANCE_KEY'], 
-    right_on=['Transporte_Alcance', 'TIPO DE VIAJE'],
+    df_alcance_config[['TRANSPORTE_ALCANCE', 'TIPO DE VIAJE', 'Tarifa_Alcance']],
+    left_on=['TRANSPORTE_ALCANCE', 'TIPO_VIAJE_ALCANCE_KEY'], 
+    right_on=['TRANSPORTE_ALCANCE', 'TIPO DE VIAJE'],
     how='left',
     suffixes=('', '_y') # Sufijo para la columna 'TIPO DE VIAJE' del df_alcance
 )
@@ -477,40 +687,100 @@ rows_after = len(billing_b_full)
 if rows_after != rows_before:
     print(f"Advertencia: el dataframe de facturación cambió de {rows_before} a {rows_after} filas después del merge de clientes")
 
-print(f"DEBUG - billing_b_full antes de agg: {len(billing_b_full)} filas")
-print(f"DEBUG - 'Reference Document number' en billing_b_full: {billing_b_full['Reference Document number'].nunique()} únicos")
-print(f"DEBUG - Ejemplos Reference Document number: {billing_b_full['Reference Document number'].unique()[:5]}")
-billing_dist_agg = billing_b_full.groupby(
-    ['Reference Document number', 'Ship to party', 'TRANSPORT ZONE', 'Ruta', 'Customer_Name_City'], as_index=False).agg({
-        'Gross weight': 'sum',
-        'Billed quantity (Base UoM)': 'sum'
-    }).rename(columns={'Billed quantity (Base UoM)': 'Cajas', 'Reference Document number': 'OBD'})
-print(f"DEBUG - billing_dist_agg: {len(billing_dist_agg)} filas agregadas")
-print(f"DEBUG - Gross weight notna en agg: {billing_dist_agg['Gross weight'].notna().sum()}")
+debug_print(f"DEBUG - billing_b_full antes de agg: {len(billing_b_full)} filas")
+debug_print(f"DEBUG - 'Reference Document number' en billing_b_full: {billing_b_full['Reference Document number'].nunique()} únicos")
+debug_print(f"DEBUG - Ejemplos Reference Document number: {billing_b_full['Reference Document number'].unique()[:5]}")
+transport_zone_col = next((col for col in ['TRANSPORT ZONE', 'TRANSPORT ZONE_x', 'TRANSPORT ZONE_y'] if col in billing_match_source.columns), None)
+ruta_col = next((col for col in ['Ruta', 'Ruta_x', 'Ruta_y', 'Ruta_SAP', 'RUTA SAP'] if col in billing_match_source.columns), None)
+
+if transport_zone_col is None:
+    raise KeyError('No se encontró ninguna columna de TRANSPORT ZONE en billing_match_source')
+
+agg_dict_direct = {
+    transport_zone_col: 'first',
+    'Gross weight': 'sum',
+    'Billed quantity (Base UoM)': 'sum'
+}
+if ruta_col is not None:
+    agg_dict_direct[ruta_col] = 'first'
+
+billing_direct_agg = billing_match_source.groupby('Reference Document number', as_index=False).agg(agg_dict_direct)
+billing_direct_agg.rename(
+    columns={
+        transport_zone_col: 'TRANSPORT ZONE',
+        'Billed quantity (Base UoM)': 'Cajas',
+        'Reference Document number': 'OBD',
+        **({ruta_col: 'Ruta'} if ruta_col is not None else {}),
+    },
+    inplace=True,
+)
+
+if 'Ruta' not in billing_direct_agg.columns:
+    billing_direct_agg['Ruta'] = ''
+
+# Lookup para viajes simples usando OBD
+billing_direct_agg['OBD'] = billing_direct_agg['OBD'].astype(str).str.strip()
+billing_direct_lookup = billing_direct_agg.set_index('OBD')
+
+# Agregado para distribución: una fila por viaje y entrega
+agg_dict_dist = {
+    transport_zone_col: 'first',
+    'Gross weight': 'sum',
+    'Billed quantity (Base UoM)': 'sum'
+}
+if ruta_col is not None:
+    agg_dict_dist[ruta_col] = 'first'
+if 'Customer_Name_City' in billing_match_source.columns:
+    agg_dict_dist['Customer_Name_City'] = 'first'
+
+billing_dist_agg = billing_match_source.groupby(['LR number', 'Ship to party'], as_index=False).agg(agg_dict_dist)
+billing_dist_agg.rename(
+    columns={
+        'LR number': 'ID_VIAJES',
+        transport_zone_col: 'TRANSPORT ZONE',
+        'Billed quantity (Base UoM)': 'Cajas',
+        **({ruta_col: 'Ruta'} if ruta_col is not None else {}),
+    },
+    inplace=True,
+)
+
+if 'Ruta' not in billing_dist_agg.columns:
+    billing_dist_agg['Ruta'] = ''
+
+billing_dist_agg['ID_VIAJES'] = billing_dist_agg['ID_VIAJES'].astype(str).str.strip()
+billing_dist_agg['Ship to party'] = billing_dist_agg['Ship to party'].astype(str).str.strip()
+
+debug_print(f"DEBUG - billing_direct_agg: {len(billing_direct_agg)} filas agregadas")
+debug_print(f"DEBUG - billing_dist_agg: {len(billing_dist_agg)} filas agregadas")
+debug_print(f"DEBUG - Gross weight notna en agg dist: {billing_dist_agg['Gross weight'].notna().sum()}")
 df_dist_detalle = df_final[df_final['TIPO DE VIAJE'].isin(['Distribución - Troncal', 'Alcance - Distribución'])].copy()
 
 if not df_dist_detalle.empty:
-    print(f"DEPURACIÓN - OBD en df_dist_detalle: {sorted(df_dist_detalle['OBD'].unique())[:10]}")
-    print(f"DEPURACIÓN - OBD en billing_dist_agg: {sorted(billing_dist_agg['OBD'].unique())[:10]}")
-    # Usar OBD para hacer merge con billing_dist_agg
-    print("Buscando coincidencias entre OBD y OBD...")
-    coincidencias = df_dist_detalle['OBD'].isin(billing_dist_agg['OBD']).sum()
-    print(f"Coincidencias encontradas: {coincidencias} / {len(df_dist_detalle)}")
-    
-    df_dist_detalle = pd.merge(df_dist_detalle, billing_dist_agg[['OBD', 'TRANSPORT ZONE', 'Ruta', 'Gross weight', 'Cajas']], 
-                               left_on='OBD', right_on='OBD', how='left')
-    print(f"DEPURACIÓN - df_dist_detalle después del merge con billing: {df_dist_detalle['TRANSPORT ZONE'].notna().sum()} / {len(df_dist_detalle)} con TRANSPORT ZONE notna.")
-    print(f"DEPURACIÓN - Gross weight notna después merge: {df_dist_detalle['Gross weight'].notna().sum()} / {len(df_dist_detalle)}")
-    print("Ejemplos después merge:")
-    print(df_dist_detalle[['OBD', 'TRANSPORT ZONE', 'Gross weight']].head(3))
+    debug_print(f"DEPURACIÓN - ID_VIAJES en df_dist_detalle: {sorted(df_dist_detalle['ID_VIAJES'].astype(str).unique())[:10]}")
+    debug_print(f"DEPURACIÓN - ID_VIAJES en billing_dist_agg: {sorted(billing_dist_agg['ID_VIAJES'].astype(str).unique())[:10]}")
+    debug_print("Buscando coincidencias entre ID_VIAJES y LR number...")
+    coincidencias = df_dist_detalle['ID_VIAJES'].astype(str).isin(billing_dist_agg['ID_VIAJES']).sum()
+    debug_print(f"Coincidencias encontradas: {coincidencias} / {len(df_dist_detalle)}")
+
+    df_dist_detalle['ID_VIAJES'] = df_dist_detalle['ID_VIAJES'].astype(str).str.strip()
+    df_dist_detalle = pd.merge(
+        df_dist_detalle,
+        billing_dist_agg,
+        on='ID_VIAJES',
+        how='left',
+        suffixes=('', '_billing')
+    )
+    debug_print(f"DEPURACIÓN - df_dist_detalle después del cruce con billing: {df_dist_detalle['TRANSPORT ZONE'].notna().sum()} / {len(df_dist_detalle)} con TRANSPORT ZONE notna.")
+    debug_print(f"DEPURACIÓN - Gross weight notna después cruce: {df_dist_detalle['Gross weight'].notna().sum()} / {len(df_dist_detalle)}")
+    debug_print("Ejemplos después cruce:")
+    debug_print(df_dist_detalle[['ID_VIAJES', 'Ship to party', 'TRANSPORT ZONE', 'Gross weight']].head(3))
     # Si no hay zona, asignar una por defecto para que la tarifación funcione
     df_dist_detalle['TRANSPORT ZONE'] = df_dist_detalle['TRANSPORT ZONE'].fillna('AR00BA1001')
-    print(f"Después de fillna zona: {df_dist_detalle['TRANSPORT ZONE'].notna().sum()} / {len(df_dist_detalle)}")
-    # MUY IMPORTANTE: Sobrescribimos la columna 'TRANSPORTE' para que 'asignar_tarifa_vectorizado' use el transportista de distribución
-    # para tarifación usamos el transportista de distribución
-    df_dist_detalle['TRANSPORTE'] = df_dist_detalle['Transporte_Distribucion']
-    df_dist_detalle_tarifado = asignar_tarifa_vectorizado(df_dist_detalle, tarifario)
-    tarifas_dist_sumadas = df_dist_detalle_tarifado.groupby('ID_FILA')['Tarifa'].first().reset_index().rename(columns={'Tarifa': 'Tarifa_Distribucion'})
+    debug_print(f"Después de fillna zona: {df_dist_detalle['TRANSPORT ZONE'].notna().sum()} / {len(df_dist_detalle)}")
+    # Para distribución el cálculo siempre usa el transportista informado en TRANSPORTE_XD.
+    df_dist_detalle['TRANSPORTE'] = df_dist_detalle['TRANSPORTE_XD']
+    df_dist_detalle_tarifado = asignar_tarifa_vectorizado(df_dist_detalle, tarifario_aux)
+    tarifas_dist_sumadas = df_dist_detalle_tarifado.groupby('ID_FILA')['Tarifa'].sum().reset_index().rename(columns={'Tarifa': 'Tarifa_Distribucion'})
     before_merge = len(df_final)
     df_final = pd.merge(df_final, tarifas_dist_sumadas, on='ID_FILA', how='left')
     after_merge = len(df_final)
@@ -524,16 +794,19 @@ df_final['Tarifa_Distribucion'] = df_final['Tarifa_Distribucion'].fillna(0)
 
 # 4. Calcular Tarifa para viajes Directos/Simples
 print("Calculando tarifas para viajes Directos...")
-df_directos = df_final[~df_final['TIPO DE VIAJE'].isin(['Distribución - Troncal', 'Alcance - Distribución'])].copy()
+df_directos = df_final[df_final['TIPO DE VIAJE'].isin(tipos_simples)].copy()
 if not df_directos.empty:
-    df_directos = pd.merge(df_directos, billing_b_full.drop_duplicates(subset=['Reference Document number']), left_on='OBD', right_on='Reference Document number', how='left')
+    # Regla de negocio: para viajes simples se usa solo una OBD por viaje.
+    # La columna OBD ya fue normalizada arriba tomando el primer valor informado.
+    df_directos['TRANSPORT ZONE'] = df_directos['OBD'].map(billing_direct_lookup['TRANSPORT ZONE'])
+    df_directos['Ruta'] = df_directos['OBD'].map(billing_direct_lookup['Ruta'])
     # Re-incluyo la lógica para buscar zonas de transporte faltantes
     zonas_conocidas = df_directos[df_directos['TRANSPORT ZONE'].notna() & (df_directos['CLIENTE'].notna())].drop_duplicates(subset=['CLIENTE'])
     mapeo_zonas = pd.Series(zonas_conocidas['TRANSPORT ZONE'].values, index=zonas_conocidas['CLIENTE']).to_dict()
     df_directos['TRANSPORT ZONE'] = df_directos['TRANSPORT ZONE'].fillna(df_directos['CLIENTE'].map(mapeo_zonas))
-    # Agregar columna 'TRANSPORTE' para viajes directos usando 'Transporte_Alcance'
-    df_directos['TRANSPORTE'] = df_directos['Transporte_Alcance']
-    df_directos_tarifado = asignar_tarifa_vectorizado(df_directos, tarifario)
+    # Para viajes simples el match se hace con TRANSPORTE_ALCANCE + TRANSPORT ZONE + UNIDAD.
+    df_directos['TRANSPORTE'] = df_directos['TRANSPORTE_ALCANCE']
+    df_directos_tarifado = asignar_tarifa_vectorizado(df_directos, tarifario_aux)
     # evitar duplicados si la tarifación produce múltiples filas por ID_FILA
     tarifas_directos_sumadas = df_directos_tarifado.groupby('ID_FILA')['Tarifa'].first().reset_index().rename(columns={'Tarifa':'Tarifa_Directo'})
     before_merge = len(df_final)
@@ -564,7 +837,7 @@ df_final['Tarifa_Alcance'] = df_final['Tarifa_Alcance'] + df_final['Tarifa_Direc
 df_final['Tarifa_Total'] = df_final['Tarifa_Alcance'] + df_final['Tarifa_Distribucion']
 
 # Limpieza de columnas temporales, manteniendo las de costos y transportistas para el output
-# no borramos Transporte_Alcance ni Transporte_Distribucion; estarán en V_BASE
+# no borramos TRANSPORTE_ALCANCE ni TRANSPORTE_XD; estarán en V_BASE
 # sólo eliminamos la columna auxiliar de tarifa directa si existe (la usamos para sumar más arriba)
 df_final.drop(columns=['Tarifa_Directo'], errors='ignore', inplace=True)
 
@@ -587,38 +860,85 @@ if not df_dist_detalle_tarifado.empty:
             df_dist_detalle_tarifado[col] = np.nan
     
     # Usar solo columnas que seguramente existan en df_dist_detalle_tarifado
-    groupby_cols = [col for col in ['ID_VIAJES', 'TRANSPORTE', 'TRANSPORT ZONE', 'Ruta'] 
+    groupby_cols = [col for col in ['ID_VIAJES', 'TRANSPORTE', 'Ship to party', 'Customer_Name_City', 'TRANSPORT ZONE', 'Ruta'] 
                     if col in df_dist_detalle_tarifado.columns]
     
     if groupby_cols:
         df_distribucion_final = df_dist_detalle_tarifado.groupby(groupby_cols).agg({
-            'Gross weight': 'first',
-            'Cajas': 'first',
+            'Gross weight': 'sum',
+            'Cajas': 'sum',
             'Aforo x 900KG': 'first',
             'X KG': 'first',
-            'Tarifa': 'first'
+            'Tarifa': 'sum'
         }).reset_index()
 
 # --- NUEVA LÓGICA PARA RESUMEN CLIENTES ---
 print(f"Generando Resumen de Clientes")
 # Usar billing_b_full (toda la facturación disponible) para los resúmenes, ya que cubre los viajes del mes
-source_map = {'AR02_IcADR_F.XLSX': '2', 'AR06_IcADR_F.XLSX': '6', 'FACTURAS_2025_Q3.xlsx': 'Q3'}
-billing_b_full['source_suffix'] = billing_b_full['source_file'].map(source_map)
-pivot_inicial = pd.pivot_table(billing_b_full, index=['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME'], columns='source_suffix', values=['Reference Document number', 'Billed quantity (Base UoM)'], aggfunc={'Reference Document number': pd.Series.nunique, 'Billed quantity (Base UoM)': 'sum'})
-pivot_inicial.columns = [f'{val}_{col}' for val, col in pivot_inicial.columns]
-column_rename_map = {'Reference Document number_2': 'OBD_ARA2', 'Reference Document number_6': 'OBD_ARA6', 'Reference Document number_Q3': 'OBD_Q3', 'Billed quantity (Base UoM)_2': 'CAR_ARA2', 'Billed quantity (Base UoM)_6': 'CAR_ARA6', 'Billed quantity (Base UoM)_Q3': 'CAR_Q3'}
-pivot_inicial.rename(columns=column_rename_map, inplace=True)
-pivot_inicial = pivot_inicial.fillna(0)
-obd_cols = [col for col in pivot_inicial.columns if 'OBD' in col]; car_cols = [col for col in pivot_inicial.columns if 'CAR' in col]
-pivot_inicial['Total_OBD'] = pivot_inicial[obd_cols].sum(axis=1)
-pivot_inicial['Total_Cajas'] = pivot_inicial[car_cols].sum(axis=1)
 
-df_costos = pd.merge(billing_b_full, df_final, left_on='LR number', right_on='ID_VIAJES', how='left')
+# Si existe la columna 'source_file' en billing_b_full, usarla; si no, asignar un valor por defecto
+if 'source_file' not in billing_b_full.columns:
+    billing_b_full['source_file'] = 'Parquet'
 
-# Separar los viajes. Los que tienen distribución son 'Distribución - Troncal' y 'Alcance - Distribución'.
-tipos_distribucion = ['Distribución - Troncal', 'Alcance - Distribución']
+# Crear el mapeo de source_suffix, manejando tanto archivos individuales como consolidados
+source_map = {
+    'AR02_IcADR_F.XLSX': '2',
+    'AR06_IcADR_F.XLSX': '6',
+    'FACTURAS_2025_Q3.xlsx': 'Q3',
+    'Parquet': 'Consolidado',  # Para archivos consolidados de Mac
+    'billing_consolidated.parquet': 'Consolidado'
+}
+billing_b_full = agregar_source_suffix(billing_b_full, source_map)
+billing_report_source = agregar_source_suffix(billing_report_source, source_map)
+
+column_rename_map = {
+    'Reference Document number_2': 'OBD_ARA2',
+    'Reference Document number_6': 'OBD_ARA6',
+    'Reference Document number_Q3': 'OBD_Q3',
+    'Reference Document number_Consolidado': 'OBD_Consolidado',
+    'Billed quantity (Base UoM)_2': 'CAR_ARA2',
+    'Billed quantity (Base UoM)_6': 'CAR_ARA6',
+    'Billed quantity (Base UoM)_Q3': 'CAR_Q3',
+    'Billed quantity (Base UoM)_Consolidado': 'CAR_Consolidado'
+}
+
+# Crear el pivot table solo si hay más de una source_suffix única
+unique_sources = billing_report_source['source_suffix'].nunique()
+if unique_sources > 1:
+    pivot_inicial = pd.pivot_table(billing_report_source, index=['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME'], columns='source_suffix', values=['Reference Document number', 'Billed quantity (Base UoM)'], aggfunc={'Reference Document number': pd.Series.nunique, 'Billed quantity (Base UoM)': 'sum'})
+    pivot_inicial.columns = [f'{val}_{col}' for val, col in pivot_inicial.columns]
+    
+    # Crear column_rename_map solo para las columnas que existan
+    available_renames = {k: v for k, v in column_rename_map.items() if k in pivot_inicial.columns}
+    pivot_inicial.rename(columns=available_renames, inplace=True)
+else:
+    # Si solo hay una fuente, crear un pivot simple
+    pivot_inicial = billing_report_source.groupby(['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME']).agg({
+        'Reference Document number': pd.Series.nunique,
+        'Billed quantity (Base UoM)': 'sum'
+    }).reset_index()
+    pivot_inicial.columns = ['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME', 'Total_OBD', 'Total_Cajas']
+
+if 'Total_OBD' not in pivot_inicial.columns:
+    pivot_inicial = pivot_inicial.fillna(0)
+    obd_cols = [col for col in pivot_inicial.columns if 'OBD' in col]
+    car_cols = [col for col in pivot_inicial.columns if 'CAR' in col]
+    if obd_cols:
+        pivot_inicial['Total_OBD'] = pivot_inicial[obd_cols].sum(axis=1)
+    if car_cols:
+        pivot_inicial['Total_Cajas'] = pivot_inicial[car_cols].sum(axis=1)
+else:
+    # Renombrar si viene del pivotar simple
+    if 'Total_OBD' in pivot_inicial.columns:
+        pass  # Ya está bien llamado
+
+df_costos = pd.merge(billing_report_source, df_final, left_on='LR number', right_on='ID_VIAJES', how='left')
+
+# Separación explícita por regla de negocio:
+# simples: una sola OBD por viaje
+# distribución: costo por viaje y Ship to
 df_dist = df_costos[df_costos['TIPO DE VIAJE'].isin(tipos_distribucion)].copy()
-df_simple = df_costos[~df_costos['TIPO DE VIAJE'].isin(tipos_distribucion)].copy()
+df_simple = df_costos[df_costos['TIPO DE VIAJE'].isin(tipos_simples)].copy()
 
 # Para viajes simples, el costo total del viaje se asigna a la entrega.
 df_simple['Costo_Total_Entrega'] = df_simple['Tarifa_Total']
@@ -633,11 +953,9 @@ if not df_dist.empty and not df_distribucion_final.empty:
     
     df_dist['Ship to party'] = df_dist['Ship to party'].astype(str)
     
-    # df_distribucion_final tiene solo ID_VIAJES, TRANSPORTE, TRANSPORT ZONE
-    # No tiene 'Ship to party' porque lo agregó el groupby.
-    # Por lo tanto, para el merge usamos SOLO ID_VIAJES (no Ship to party)
-    df_dist = pd.merge(df_dist, df_distribucion_final[['ID_VIAJES', 'TRANSPORT ZONE', 'Tarifa']],
-                       on=['ID_VIAJES', 'TRANSPORT ZONE'], how='left', suffixes=('', '_dist'))
+    df_distribucion_merge_cols = [col for col in ['ID_VIAJES', 'Ship to party', 'Tarifa'] if col in df_distribucion_final.columns]
+    df_dist = pd.merge(df_dist, df_distribucion_final[df_distribucion_merge_cols],
+                       on=['ID_VIAJES', 'Ship to party'], how='left', suffixes=('', '_dist'))
     df_dist.rename(columns={'Tarifa': 'Costo_Por_Entrega', 'Tarifa_dist': 'Tarifa'}, inplace=True)
 
     # 2. Calcular el costo de alcance proporcional.
@@ -664,34 +982,51 @@ if not df_simple.empty:
 dfs_to_concat = [df for df in [df_simple, df_dist] if not df.empty]
 df_costos_final = pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else pd.DataFrame()
 # verificar duplicados tras concatenar simples y distribución
-dup_costos = df_costos_final[['ID_VIAJES','Ship to party']].duplicated().sum()
-if dup_costos:
-    print(f"Advertencia: df_costos_final tiene {dup_costos} filas duplicadas en combinación ID_VIAJES/Ship to party")
+if all(col in df_costos_final.columns for col in ['ID_VIAJES', 'Ship to party']):
+    dup_costos = df_costos_final[['ID_VIAJES', 'Ship to party']].duplicated().sum()
+    if dup_costos:
+        print(f"Advertencia: df_costos_final tiene {dup_costos} filas duplicadas en combinación ID_VIAJES/Ship to party")
 
-costo_total_por_cliente = df_costos_final.groupby(['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME'])['Costo_Total_Entrega'].sum().reset_index().rename(columns={'Costo_Total_Entrega': 'Tarifa_Total_Cliente'})
-df_reporte_final = pd.merge(pivot_inicial.reset_index(), costo_total_por_cliente, on=['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME'], how='left')
+if all(col in df_costos_final.columns for col in ['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME', 'Costo_Total_Entrega']):
+    costo_total_por_cliente = df_costos_final.groupby(['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME'])['Costo_Total_Entrega'].sum().reset_index().rename(columns={'Costo_Total_Entrega': 'Tarifa_Total_Cliente'})
+else:
+    costo_total_por_cliente = pd.DataFrame(columns=['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME', 'Tarifa_Total_Cliente'])
+
+df_reporte_final = pd.merge(reset_index_if_needed(pivot_inicial), costo_total_por_cliente, on=['CLIENTE_MC_NUM', 'CLIENTE_MC_NAME'], how='left')
 df_reporte_final['Costo_por_Caja'] = (df_reporte_final['Tarifa_Total_Cliente'] / df_reporte_final['Total_Cajas']).fillna(0)
 
 # --- NUEVA LÓGICA PARA RESUMEN SHIP-TO ---
 print(f"Generando Resumen de Ship-To")
 
 # 1. Crear el pivot de cantidades a nivel de Ship To
-pivot_shipto = pd.pivot_table(
-    billing_b_full,
-    index=['Ship to party', 'Ship to party name'],
-    columns='source_suffix',
-    values=['Reference Document number', 'Billed quantity (Base UoM)'],
-    aggfunc={'Reference Document number': pd.Series.nunique, 'Billed quantity (Base UoM)': 'sum'}
-)
-pivot_shipto.columns = [f'{val}_{col}' for val, col in pivot_shipto.columns]
-pivot_shipto.rename(columns=column_rename_map, inplace=True)
-pivot_shipto = pivot_shipto.fillna(0)
-
-# 2. Calcular totales de OBD y Cajas para Ship To
-obd_cols_st = [col for col in pivot_shipto.columns if 'OBD' in col]
-car_cols_st = [col for col in pivot_shipto.columns if 'CAR' in col]
-pivot_shipto['Total_OBD'] = pivot_shipto[obd_cols_st].sum(axis=1)
-pivot_shipto['Total_Cajas'] = pivot_shipto[car_cols_st].sum(axis=1)
+if unique_sources > 1:
+    pivot_shipto = pd.pivot_table(
+        billing_report_source,
+        index=['Ship to party', 'Ship to party name'],
+        columns='source_suffix',
+        values=['Reference Document number', 'Billed quantity (Base UoM)'],
+        aggfunc={'Reference Document number': pd.Series.nunique, 'Billed quantity (Base UoM)': 'sum'}
+    )
+    pivot_shipto.columns = [f'{val}_{col}' for val, col in pivot_shipto.columns]
+    
+    shipto_renames = {k: v for k, v in column_rename_map.items() if k in pivot_shipto.columns}
+    pivot_shipto.rename(columns=shipto_renames, inplace=True)
+    pivot_shipto = pivot_shipto.fillna(0)
+    
+    # 2. Calcular totales de OBD y Cajas para Ship To
+    obd_cols_st = [col for col in pivot_shipto.columns if 'OBD' in col]
+    car_cols_st = [col for col in pivot_shipto.columns if 'CAR' in col]
+    if obd_cols_st:
+        pivot_shipto['Total_OBD'] = pivot_shipto[obd_cols_st].sum(axis=1)
+    if car_cols_st:
+        pivot_shipto['Total_Cajas'] = pivot_shipto[car_cols_st].sum(axis=1)
+else:
+    # Si solo hay una fuente, crear un pivot simple
+    pivot_shipto = billing_report_source.groupby(['Ship to party', 'Ship to party name']).agg({
+        'Reference Document number': pd.Series.nunique,
+        'Billed quantity (Base UoM)': 'sum'
+    }).reset_index()
+    pivot_shipto.columns = ['Ship to party', 'Ship to party name', 'Total_OBD', 'Total_Cajas']
 
 # 3. Calcular el costo total por Ship To desde df_costos_final
 # Aseguramos que las columnas para el groupby existan
@@ -704,7 +1039,7 @@ else:
 
 # 4. Unir la información de costos con la de cantidades
 df_reporte_shipto_final = pd.merge(
-    pivot_shipto.reset_index(),
+    reset_index_if_needed(pivot_shipto),
     costo_total_por_shipto,
     on=['Ship to party', 'Ship to party name'],
     how='left'
@@ -719,22 +1054,34 @@ df_reporte_shipto_final['Costo_por_Caja'] = (df_reporte_shipto_final['Tarifa_Tot
 print(f"Generando Resumen de Rutas")
 
 # 1. Crear el pivot de cantidades a nivel de Ruta
-pivot_ruta = pd.pivot_table(
-    billing_b_full,
-    index=['Ruta'],
-    columns='source_suffix',
-    values=['Reference Document number', 'Billed quantity (Base UoM)'],
-    aggfunc={'Reference Document number': pd.Series.nunique, 'Billed quantity (Base UoM)': 'sum'}
-)
-pivot_ruta.columns = [f'{val}_{col}' for val, col in pivot_ruta.columns]
-pivot_ruta.rename(columns=column_rename_map, inplace=True)
-pivot_ruta = pivot_ruta.fillna(0)
-
-# 2. Calcular totales de OBD y Cajas para Ruta
-obd_cols_rt = [col for col in pivot_ruta.columns if 'OBD' in col]
-car_cols_rt = [col for col in pivot_ruta.columns if 'CAR' in col]
-pivot_ruta['Total_OBD'] = pivot_ruta[obd_cols_rt].sum(axis=1)
-pivot_ruta['Total_Cajas'] = pivot_ruta[car_cols_rt].sum(axis=1)
+if unique_sources > 1:
+    pivot_ruta = pd.pivot_table(
+        billing_report_source,
+        index=['Ruta'],
+        columns='source_suffix',
+        values=['Reference Document number', 'Billed quantity (Base UoM)'],
+        aggfunc={'Reference Document number': pd.Series.nunique, 'Billed quantity (Base UoM)': 'sum'}
+    )
+    pivot_ruta.columns = [f'{val}_{col}' for val, col in pivot_ruta.columns]
+    
+    ruta_renames = {k: v for k, v in column_rename_map.items() if k in pivot_ruta.columns}
+    pivot_ruta.rename(columns=ruta_renames, inplace=True)
+    pivot_ruta = pivot_ruta.fillna(0)
+    
+    # 2. Calcular totales de OBD y Cajas para Ruta
+    obd_cols_rt = [col for col in pivot_ruta.columns if 'OBD' in col]
+    car_cols_rt = [col for col in pivot_ruta.columns if 'CAR' in col]
+    if obd_cols_rt:
+        pivot_ruta['Total_OBD'] = pivot_ruta[obd_cols_rt].sum(axis=1)
+    if car_cols_rt:
+        pivot_ruta['Total_Cajas'] = pivot_ruta[car_cols_rt].sum(axis=1)
+else:
+    # Si solo hay una fuente, crear un pivot simple
+    pivot_ruta = billing_report_source.groupby('Ruta').agg({
+        'Reference Document number': pd.Series.nunique,
+        'Billed quantity (Base UoM)': 'sum'
+    }).reset_index()
+    pivot_ruta.columns = ['Ruta', 'Total_OBD', 'Total_Cajas']
 
 # 3. Calcular el costo total por Ruta desde df_costos_final
 if 'Ruta' in df_costos_final.columns:
@@ -744,7 +1091,7 @@ else:
 
 # 4. Unir la información de costos con la de cantidades
 df_reporte_ruta_final = pd.merge(
-    pivot_ruta.reset_index(),
+    reset_index_if_needed(pivot_ruta),
     costo_total_por_ruta,
     on='Ruta',
     how='left'
@@ -757,7 +1104,8 @@ df_reporte_ruta_final['Costo_por_Caja'] = (df_reporte_ruta_final['Tarifa_Total_R
 
 # --- Guardar en Excel ---
 print("Guardando resultados en 'Provision_Calculada.xlsx'...")
-with pd.ExcelWriter('Provision_Calculada.xlsx', engine='xlsxwriter') as writer:
+excel_engine = 'xlsxwriter' if importlib.util.find_spec('xlsxwriter') else 'openpyxl'
+with pd.ExcelWriter('Provision_Calculada.xlsx', engine=excel_engine) as writer:
     df_final.to_excel(writer, sheet_name='V_BASE', index=False)
     df_directos_final.to_excel(writer, sheet_name='Directos', index=False)
     df_distribucion_final.to_excel(writer, sheet_name='Distribucion', index=False)

@@ -1,4 +1,5 @@
 {
-    "chat.agentSessionsViewLocation": "disabled"
+    "chat.agentSessionsViewLocation": "disabled",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
     
 }

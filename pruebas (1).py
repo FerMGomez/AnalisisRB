@@ -182,7 +182,7 @@ def load_rutas(path):
     normaliza y elimina duplicados.
     """
     # Columnas: A=0, B=1, ..., R=17, U=20
-    df = pd.read_excel(path, usecols=[17, 20], skiprows=1, engine='openpyxl', header=None)
+    df = pd.read_excel(path, sheet_name='OBD', usecols=[17, 20], skiprows=1, engine='openpyxl', header=None)
     df.columns = ['TRANSPORT ZONE', 'Ruta']
     df = normalize_columns(df, ['TRANSPORT ZONE', 'Ruta'])
     df.drop_duplicates(subset=['TRANSPORT ZONE'], inplace=True)
